@@ -68,6 +68,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -80,6 +81,8 @@ public class WifiNetworkFactory extends NetworkFactory {
     private static final String TAG = "WifiNetworkFactory";
     @VisibleForTesting
     private static final int SCORE_FILTER = 60;
+    @VisibleForTesting
+    public static final int CACHED_SCAN_RESULTS_MAX_AGE_IN_MILLIS = 20 * 1000;  // 20 seconds
     @VisibleForTesting
     public static final int PERIODIC_SCAN_INTERVAL_MS = 10 * 1000; // 10 seconds
     @VisibleForTesting
@@ -97,6 +100,9 @@ public class WifiNetworkFactory extends NetworkFactory {
     @VisibleForTesting
     public static final String UI_START_INTENT_EXTRA_REQUEST_IS_FOR_SINGLE_NETWORK =
             "com.android.settings.wifi.extra.REQUEST_IS_FOR_SINGLE_NETWORK";
+    // Capacity limit of approved Access Point per App
+    @VisibleForTesting
+    public static final int NUM_OF_ACCESS_POINT_LIMIT_PER_APP = 50;
 
     private final Context mContext;
     private final ActivityManager mActivityManager;
@@ -117,8 +123,8 @@ public class WifiNetworkFactory extends NetworkFactory {
     private final ExternalCallbackTracker<INetworkRequestMatchCallback> mRegisteredCallbacks;
     private final Messenger mSrcMessenger;
     // Store all user approved access points for apps.
-    // TODO(b/122658039): Persist this.
-    private final Map<String, Set<AccessPoint>> mUserApprovedAccessPointMap = new HashMap<>();
+    @VisibleForTesting
+    public final Map<String, LinkedHashSet<AccessPoint>> mUserApprovedAccessPointMap;
     private WifiScanner mWifiScanner;
 
     private int mGenericConnectionReqCount = 0;
@@ -226,37 +232,10 @@ public class WifiNetworkFactory extends NetworkFactory {
             if (mVerboseLoggingEnabled) {
                 Log.v(TAG, "Received " + scanResults.length + " scan results");
             }
-            List<ScanResult> matchedScanResults =
-                    getNetworksMatchingActiveNetworkRequest(scanResults);
-            if (mActiveMatchedScanResults == null) {
-                // only note the first match size in metrics (chances of this changing in further
-                // scans is pretty low)
-                mWifiMetrics.incrementNetworkRequestApiMatchSizeHistogram(
-                        matchedScanResults.size());
-            }
-            mActiveMatchedScanResults = matchedScanResults;
-
-            ScanResult approvedScanResult = null;
-            if (isActiveRequestForSingleAccessPoint()) {
-                approvedScanResult =
-                        findUserApprovedAccessPointForActiveRequestFromActiveMatchedScanResults();
-            }
-            if (approvedScanResult != null
-                    && !mWifiConfigManager.wasEphemeralNetworkDeleted(
-                            ScanResultUtil.createQuotedSSID(approvedScanResult.SSID))) {
-                Log.v(TAG, "Approved access point found in matching scan results. "
-                        + "Triggering connect " + approvedScanResult);
-                handleConnectToNetworkUserSelectionInternal(
-                        ScanResultUtil.createNetworkFromScanResult(approvedScanResult));
-                mWifiMetrics.incrementNetworkRequestApiNumUserApprovalBypass();
-                // TODO (b/122658039): Post notification.
-            } else {
-                if (mVerboseLoggingEnabled) {
-                    Log.v(TAG, "No approved access points found in matching scan results. "
-                            + "Sending match callback");
-                }
-                sendNetworkRequestMatchCallbacksForActiveRequest(matchedScanResults);
-                // Didn't find an approved match, schedule the next scan.
+            if (!handleScanResultsAndTriggerConnectIfUserApprovedMatchFound(scanResults)) {
+                // Didn't find an approved match, send the matching results to UI and schedule the
+                // next scan.
+                sendNetworkRequestMatchCallbacksForActiveRequest(mActiveMatchedScanResults);
                 scheduleNextPeriodicScan();
             }
         }
@@ -346,12 +325,13 @@ public class WifiNetworkFactory extends NetworkFactory {
         public Map<String, Set<AccessPoint>> toSerialize() {
             // Clear the flag after writing to disk.
             mHasNewDataToSerialize = false;
-            return mUserApprovedAccessPointMap;
+            return new HashMap<>(mUserApprovedAccessPointMap);
         }
 
         @Override
         public void fromDeserialized(Map<String, Set<AccessPoint>> approvedAccessPointMap) {
-            mUserApprovedAccessPointMap.putAll(approvedAccessPointMap);
+            approvedAccessPointMap.forEach((key, value) ->
+                    mUserApprovedAccessPointMap.put(key, new LinkedHashSet<>(value)));
         }
 
         @Override
@@ -397,6 +377,7 @@ public class WifiNetworkFactory extends NetworkFactory {
         mConnectionTimeoutAlarmListener = new ConnectionTimeoutAlarmListener();
         mRegisteredCallbacks = new ExternalCallbackTracker<INetworkRequestMatchCallback>(mHandler);
         mSrcMessenger = new Messenger(new Handler(looper, mNetworkConnectionTriggerCallback));
+        mUserApprovedAccessPointMap = new HashMap<>();
 
         // register the data store for serializing/deserializing data.
         configStore.registerStoreData(
@@ -447,7 +428,12 @@ public class WifiNetworkFactory extends NetworkFactory {
                     new NetworkFactoryUserSelectionCallback(mActiveSpecificNetworkRequest));
         } catch (RemoteException e) {
             Log.e(TAG, "Unable to invoke user selection registration callback " + callback, e);
+            return;
         }
+
+        // If we are already in the midst of processing a request, send matching callbacks
+        // immediately on registering the callback.
+        sendNetworkRequestMatchCallbacksForActiveRequest(mActiveMatchedScanResults);
     }
 
     /**
@@ -606,10 +592,19 @@ public class WifiNetworkFactory extends NetworkFactory {
                     wns.requestorUid, wns.requestorPackageName);
             mWifiMetrics.incrementNetworkRequestApiNumRequest();
 
-            // Start UI to let the user grant/disallow this request from the app.
-            startUi();
-            // Trigger periodic scans for finding a network in the request.
-            startPeriodicScans();
+            // Fetch the latest cached scan results to speed up network matching.
+            ScanResult[] cachedScanResults = getFilteredCachedScanResults();
+            if (mVerboseLoggingEnabled) {
+                Log.v(TAG, "Using cached " + cachedScanResults.length + " scan results");
+            }
+            if (!handleScanResultsAndTriggerConnectIfUserApprovedMatchFound(cachedScanResults)) {
+                // Start UI to let the user grant/disallow this request from the app.
+                startUi();
+                // Didn't find an approved match, send the matching results to UI and trigger
+                // periodic scans for finding a network in the request.
+                sendNetworkRequestMatchCallbacksForActiveRequest(mActiveMatchedScanResults);
+                startPeriodicScans();
+            }
         }
     }
 
@@ -706,6 +701,11 @@ public class WifiNetworkFactory extends NetworkFactory {
         WifiConfiguration existingSavedNetwork =
                 mWifiConfigManager.getConfiguredNetwork(network.configKey());
         if (existingSavedNetwork != null) {
+            if (WifiConfigurationUtil.hasCredentialChanged(existingSavedNetwork, network)) {
+                // TODO (b/142035508): What if the user has a saved network with different
+                // credentials?
+                Log.w(TAG, "Network config already present in config manager, reusing");
+            }
             return existingSavedNetwork.networkId;
         }
         NetworkUpdateResult networkUpdateResult =
@@ -716,6 +716,32 @@ public class WifiNetworkFactory extends NetworkFactory {
             Log.v(TAG, "Added network to config manager " + networkUpdateResult.netId);
         }
         return networkUpdateResult.netId;
+    }
+
+    // Helper method to remove the provided network configuration from WifiConfigManager, if it was
+    // added by an app's specifier request.
+    private void disconnectAndRemoveNetworkFromWifiConfigManager(
+            @Nullable WifiConfiguration network) {
+        // Trigger a disconnect first.
+        mWifiInjector.getClientModeImpl().disconnectCommand();
+
+        if (network == null) return;
+        WifiConfiguration wcmNetwork =
+                mWifiConfigManager.getConfiguredNetwork(network.configKey());
+        if (wcmNetwork == null) {
+            Log.e(TAG, "Network not present in config manager");
+            return;
+        }
+        // Remove the network if it was added previously by an app's specifier request.
+        if (wcmNetwork.ephemeral && wcmNetwork.fromWifiNetworkSpecifier) {
+            boolean success =
+                    mWifiConfigManager.removeNetwork(wcmNetwork.networkId, wcmNetwork.creatorUid);
+            if (!success) {
+                Log.e(TAG, "Failed to remove network from config manager");
+            } else if (mVerboseLoggingEnabled) {
+                Log.v(TAG, "Removed network from config manager " + wcmNetwork.networkId);
+            }
+        }
     }
 
     // Helper method to trigger a connection request & schedule a timeout alarm to track the
@@ -756,7 +782,6 @@ public class WifiNetworkFactory extends NetworkFactory {
         networkToConnect.SSID = network.SSID;
         // Set the WifiConfiguration.BSSID field to prevent roaming.
         networkToConnect.BSSID = findBestBssidFromActiveMatchedScanResultsForNetwork(network);
-        // Mark the network ephemeral so that it's automatically removed at the end of connection.
         networkToConnect.ephemeral = true;
         networkToConnect.fromWifiNetworkSpecifier = true;
 
@@ -764,7 +789,8 @@ public class WifiNetworkFactory extends NetworkFactory {
         mUserSelectedNetwork = networkToConnect;
 
         // Disconnect from the current network before issuing a new connect request.
-        mWifiInjector.getClientModeImpl().disconnectCommand();
+        disconnectAndRemoveNetworkFromWifiConfigManager(mUserSelectedNetwork);
+
         // Trigger connection to the network.
         connectToNetwork(networkToConnect);
         // Triggered connection to network, now wait for the connection status.
@@ -960,6 +986,7 @@ public class WifiNetworkFactory extends NetworkFactory {
         mConnectedSpecificNetworkRequestSpecifier = mActiveSpecificNetworkRequestSpecifier;
         mActiveSpecificNetworkRequest = null;
         mActiveSpecificNetworkRequestSpecifier = null;
+        mActiveMatchedScanResults = null;
         mPendingConnectionSuccess = false;
         // Cancel connection timeout alarm.
         cancelConnectionTimeout();
@@ -968,7 +995,7 @@ public class WifiNetworkFactory extends NetworkFactory {
     // Invoked at the termination of current connected request processing.
     private void teardownForConnectedNetwork() {
         Log.i(TAG, "Disconnecting from network on reset");
-        mWifiInjector.getClientModeImpl().disconnectCommand();
+        disconnectAndRemoveNetworkFromWifiConfigManager(mUserSelectedNetwork);
         mConnectedSpecificNetworkRequest = null;
         mConnectedSpecificNetworkRequestSpecifier = null;
         // ensure there is no active request in progress.
@@ -1106,7 +1133,8 @@ public class WifiNetworkFactory extends NetworkFactory {
     }
 
     private void sendNetworkRequestMatchCallbacksForActiveRequest(
-            List<ScanResult> matchedScanResults) {
+            @Nullable List<ScanResult> matchedScanResults) {
+        if (matchedScanResults == null || matchedScanResults.isEmpty()) return;
         if (mRegisteredCallbacks.getNumCallbacks() == 0) {
             Log.e(TAG, "No callback registered for sending network request matches. "
                     + "Ignoring...");
@@ -1135,10 +1163,11 @@ public class WifiNetworkFactory extends NetworkFactory {
         mConnectionTimeoutSet = true;
     }
 
-    private @NonNull CharSequence getAppName(@NonNull String packageName) {
+    private @NonNull CharSequence getAppName(@NonNull String packageName, int uid) {
         ApplicationInfo applicationInfo = null;
         try {
-            applicationInfo = mContext.getPackageManager().getApplicationInfo(packageName, 0);
+            applicationInfo = mContext.getPackageManager().getApplicationInfoAsUser(
+                packageName, 0, UserHandle.getUserId(uid));
         } catch (PackageManager.NameNotFoundException e) {
             Log.e(TAG, "Failed to find app name for " + packageName);
             return "";
@@ -1153,7 +1182,8 @@ public class WifiNetworkFactory extends NetworkFactory {
         intent.addCategory(UI_START_INTENT_CATEGORY);
         intent.setFlags(Intent.FLAG_ACTIVITY_BROUGHT_TO_FRONT | Intent.FLAG_ACTIVITY_NEW_TASK);
         intent.putExtra(UI_START_INTENT_EXTRA_APP_NAME,
-                getAppName(mActiveSpecificNetworkRequestSpecifier.requestorPackageName));
+                getAppName(mActiveSpecificNetworkRequestSpecifier.requestorPackageName,
+                           mActiveSpecificNetworkRequestSpecifier.requestorUid));
         intent.putExtra(UI_START_INTENT_EXTRA_REQUEST_IS_FOR_SINGLE_NETWORK,
                 isActiveRequestForSingleNetwork());
         mContext.startActivityAsUser(intent, UserHandle.getUserHandleForUid(
@@ -1235,6 +1265,9 @@ public class WifiNetworkFactory extends NetworkFactory {
                     new AccessPoint(scanResult.SSID,
                             MacAddress.fromString(scanResult.BSSID), fromScanResult.networkType);
             if (approvedAccessPoints.contains(accessPoint)) {
+                // keep the most recently used AP in the end
+                approvedAccessPoints.remove(accessPoint);
+                approvedAccessPoints.add(accessPoint);
                 if (mVerboseLoggingEnabled) {
                     Log.v(TAG, "Found " + accessPoint
                             + " in user approved access point for " + requestorPackageName);
@@ -1254,10 +1287,11 @@ public class WifiNetworkFactory extends NetworkFactory {
         // object representing an entire network from UI, we need to ensure that all the visible
         // BSSIDs matching the original request and the selected network are stored.
         Set<AccessPoint> newUserApprovedAccessPoints = new HashSet<>();
+
+        ScanResultMatchInfo fromWifiConfiguration =
+                ScanResultMatchInfo.fromWifiConfiguration(network);
         for (ScanResult scanResult : mActiveMatchedScanResults) {
             ScanResultMatchInfo fromScanResult = ScanResultMatchInfo.fromScanResult(scanResult);
-            ScanResultMatchInfo fromWifiConfiguration =
-                    ScanResultMatchInfo.fromWifiConfiguration(network);
             if (fromScanResult.equals(fromWifiConfiguration)) {
                 AccessPoint approvedAccessPoint =
                         new AccessPoint(scanResult.SSID, MacAddress.fromString(scanResult.BSSID),
@@ -1268,10 +1302,10 @@ public class WifiNetworkFactory extends NetworkFactory {
         if (newUserApprovedAccessPoints.isEmpty()) return;
 
         String requestorPackageName = mActiveSpecificNetworkRequestSpecifier.requestorPackageName;
-        Set<AccessPoint> approvedAccessPoints =
+        LinkedHashSet<AccessPoint> approvedAccessPoints =
                 mUserApprovedAccessPointMap.get(requestorPackageName);
         if (approvedAccessPoints == null) {
-            approvedAccessPoints = new HashSet<>();
+            approvedAccessPoints = new LinkedHashSet<>();
             mUserApprovedAccessPointMap.put(requestorPackageName, approvedAccessPoints);
             // Note the new app in metrics.
             mWifiMetrics.incrementNetworkRequestApiNumApps();
@@ -1280,22 +1314,92 @@ public class WifiNetworkFactory extends NetworkFactory {
             Log.v(TAG, "Adding " + newUserApprovedAccessPoints
                     + " to user approved access point for " + requestorPackageName);
         }
+        // keep the most recently added APs in the end
+        approvedAccessPoints.removeAll(newUserApprovedAccessPoints);
         approvedAccessPoints.addAll(newUserApprovedAccessPoints);
+        cleanUpLRUAccessPoints(approvedAccessPoints);
         saveToStore();
+    }
+
+    /**
+     * Handle scan results
+     * a) Find all scan results matching the active network request.
+     * b) If the request is for a single bssid, check if the matching ScanResult was pre-approved
+     * by the user.
+     * c) If yes to (b), trigger a connect immediately and returns true. Else, returns false.
+     *
+     * @param scanResults Array of {@link ScanResult} to be processed.
+     * @return true if a pre-approved network was found for connection, false otherwise.
+     */
+    private boolean handleScanResultsAndTriggerConnectIfUserApprovedMatchFound(
+            ScanResult[] scanResults) {
+        List<ScanResult> matchedScanResults =
+                getNetworksMatchingActiveNetworkRequest(scanResults);
+        if ((mActiveMatchedScanResults == null || mActiveMatchedScanResults.isEmpty())
+                && !matchedScanResults.isEmpty()) {
+            // only note the first match size in metrics (chances of this changing in further
+            // scans is pretty low)
+            mWifiMetrics.incrementNetworkRequestApiMatchSizeHistogram(
+                    matchedScanResults.size());
+        }
+        mActiveMatchedScanResults = matchedScanResults;
+
+        ScanResult approvedScanResult = null;
+        if (isActiveRequestForSingleAccessPoint()) {
+            approvedScanResult =
+                    findUserApprovedAccessPointForActiveRequestFromActiveMatchedScanResults();
+        }
+        if (approvedScanResult != null
+                && !mWifiConfigManager.wasEphemeralNetworkDeleted(
+                ScanResultUtil.createQuotedSSID(approvedScanResult.SSID))) {
+            Log.v(TAG, "Approved access point found in matching scan results. "
+                    + "Triggering connect " + approvedScanResult);
+            handleConnectToNetworkUserSelectionInternal(
+                    ScanResultUtil.createNetworkFromScanResult(approvedScanResult));
+            mWifiMetrics.incrementNetworkRequestApiNumUserApprovalBypass();
+            return true;
+        }
+        if (mVerboseLoggingEnabled) {
+            Log.v(TAG, "No approved access points found in matching scan results");
+        }
+        return false;
+    }
+
+    /**
+     * Retrieve the latest cached scan results from wifi scanner and filter out any
+     * {@link ScanResult} older than {@link #CACHED_SCAN_RESULTS_MAX_AGE_IN_MILLIS}.
+     */
+    private @NonNull ScanResult[] getFilteredCachedScanResults() {
+        List<ScanResult> cachedScanResults = mWifiScanner.getSingleScanResults();
+        if (cachedScanResults == null || cachedScanResults.isEmpty()) return new ScanResult[0];
+        long currentTimeInMillis = mClock.getElapsedSinceBootMillis();
+        return cachedScanResults.stream()
+                .filter(scanResult
+                        -> ((currentTimeInMillis - (scanResult.timestamp / 1000))
+                        < CACHED_SCAN_RESULTS_MAX_AGE_IN_MILLIS))
+                .toArray(ScanResult[]::new);
+    }
+
+    /**
+     * Clean up least recently used Access Points if specified app reach the limit.
+     */
+    private static void cleanUpLRUAccessPoints(Set<AccessPoint> approvedAccessPoints) {
+        if (approvedAccessPoints.size() <= NUM_OF_ACCESS_POINT_LIMIT_PER_APP) {
+            return;
+        }
+        Iterator iter = approvedAccessPoints.iterator();
+        while (iter.hasNext() && approvedAccessPoints.size() > NUM_OF_ACCESS_POINT_LIMIT_PER_APP) {
+            iter.next();
+            iter.remove();
+        }
     }
 
     /**
      * Remove all user approved access points for the specified app.
      */
     public void removeUserApprovedAccessPointsForApp(@NonNull String packageName) {
-        Iterator<Map.Entry<String, Set<AccessPoint>>> iter =
-                mUserApprovedAccessPointMap.entrySet().iterator();
-        while (iter.hasNext()) {
-            Map.Entry<String, Set<AccessPoint>> entry = iter.next();
-            if (packageName.equals(entry.getKey())) {
-                Log.i(TAG, "Removing all approved access points for " + packageName);
-                iter.remove();
-            }
+        if (mUserApprovedAccessPointMap.remove(packageName) != null) {
+            Log.i(TAG, "Removing all approved access points for " + packageName);
         }
         saveToStore();
     }

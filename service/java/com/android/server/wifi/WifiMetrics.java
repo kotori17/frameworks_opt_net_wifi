@@ -2782,6 +2782,16 @@ public class WifiMetrics {
                         + mExperimentValues.wifiDataStallMinTxSuccessWithoutRx);
                 pw.println("mExperimentValues.linkSpeedCountsLoggingEnabled="
                         + mExperimentValues.linkSpeedCountsLoggingEnabled);
+                pw.println("mExperimentValues.dataStallDurationMs="
+                        + mExperimentValues.dataStallDurationMs);
+                pw.println("mExperimentValues.dataStallTxTputThrMbps="
+                        + mExperimentValues.dataStallTxTputThrMbps);
+                pw.println("mExperimentValues.dataStallRxTputThrMbps="
+                        + mExperimentValues.dataStallRxTputThrMbps);
+                pw.println("mExperimentValues.dataStallTxPerThr="
+                        + mExperimentValues.dataStallTxPerThr);
+                pw.println("mExperimentValues.dataStallCcaLevelThr="
+                        + mExperimentValues.dataStallCcaLevelThr);
                 pw.println("WifiIsUnusableEventList: ");
                 for (WifiIsUnusableWithTime event : mWifiIsUnusableList) {
                     pw.println(event);
@@ -2932,6 +2942,7 @@ public class WifiMetrics {
     public void updateSavedNetworks(List<WifiConfiguration> networks) {
         synchronized (mLock) {
             mWifiLogProto.numSavedNetworks = networks.size();
+            mWifiLogProto.numSavedNetworksWithMacRandomization = 0;
             mWifiLogProto.numOpenNetworks = 0;
             mWifiLogProto.numLegacyPersonalNetworks = 0;
             mWifiLogProto.numLegacyEnterpriseNetworks = 0;
@@ -3780,9 +3791,11 @@ public class WifiMetrics {
         mLastScore = -1;
         mLastWifiUsabilityScore = -1;
         mLastPredictionHorizonSec = -1;
-        mStaEventList.add(new StaEventWithTime(staEvent, mClock.getWallClockMillis()));
-        // Prune StaEventList if it gets too long
-        if (mStaEventList.size() > MAX_STA_EVENTS) mStaEventList.remove();
+        synchronized (mLock) {
+            mStaEventList.add(new StaEventWithTime(staEvent, mClock.getWallClockMillis()));
+            // Prune StaEventList if it gets too long
+            if (mStaEventList.size() > MAX_STA_EVENTS) mStaEventList.remove();
+        }
     }
 
     private ConfigInfo createConfigInfo(WifiConfiguration config) {
@@ -4614,6 +4627,7 @@ public class WifiMetrics {
                 }
             }
             mWifiUsabilityStatsCounter = 0;
+            mWifiUsabilityStatsEntriesList.clear();
         }
     }
 
@@ -5189,6 +5203,51 @@ public class WifiMetrics {
     public void incrementPasspointProvisionSuccess() {
         synchronized (mLock) {
             mNumProvisionSuccess++;
+        }
+    }
+
+    /**
+     * Sets the duration for evaluating Wifi condition to trigger a data stall
+     */
+    public void setDataStallDurationMs(int duration) {
+        synchronized (mLock) {
+            mExperimentValues.dataStallDurationMs = duration;
+        }
+    }
+
+    /**
+     * Sets the threshold of Tx throughput below which to trigger a data stall
+     */
+    public void setDataStallTxTputThrMbps(int txTputThr) {
+        synchronized (mLock) {
+            mExperimentValues.dataStallTxTputThrMbps = txTputThr;
+        }
+    }
+
+    /**
+     * Sets the threshold of Rx throughput below which to trigger a data stall
+     */
+    public void setDataStallRxTputThrMbps(int rxTputThr) {
+        synchronized (mLock) {
+            mExperimentValues.dataStallRxTputThrMbps = rxTputThr;
+        }
+    }
+
+    /**
+     * Sets the threshold of Tx packet error rate above which to trigger a data stall
+     */
+    public void setDataStallTxPerThr(int txPerThr) {
+        synchronized (mLock) {
+            mExperimentValues.dataStallTxPerThr = txPerThr;
+        }
+    }
+
+    /**
+     * Sets the threshold of CCA level above which to trigger a data stall
+     */
+    public void setDataStallCcaLevelThr(int ccaLevel) {
+        synchronized (mLock) {
+            mExperimentValues.dataStallCcaLevelThr = ccaLevel;
         }
     }
 }
